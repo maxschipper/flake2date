@@ -1,12 +1,34 @@
-import requests
+import argparse
 import json
 import os
+import subprocess
 import sys
-import argparse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+
+import requests
 
 # --- Configuration ---
 FLAKE_LOCK_PATH = os.environ.get("NH_FLAKE", ".") + "/flake.lock"
+
+
+def get_token_from_gh_cli():
+    """
+    Attempts to retrieve the GitHub token from the 'gh' CLI tool.
+    Returns the token string or None if not available.
+    """
+    try:
+        # 'gh auth token' outputs the active authentication token
+        result = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, check=True
+        )
+        token = result.stdout.strip()
+        if token:
+            return token
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # FileNotFoundError: 'gh' is not installed
+        # CalledProcessError: 'gh' command failed (e.g. not logged in)
+        pass
+    return None
 
 
 def get_upstream_info(owner, repo, branch_hint=None, token=None):
@@ -130,9 +152,14 @@ def main():
     # Optional: Get GitHub Token from Env
     token = os.environ.get("GITHUB_TOKEN")
     if not token and args.all:
-        print(
-            "ℹ️  Tip: Set GITHUB_TOKEN to avoid rate limits when checking multiple inputs.\n"
-        )
+        token = get_token_from_gh_cli()
+        if token:
+            print("ℹ️  Using authentication token from 'gh' CLI.")
+        elif args.all:
+            # Only warn if we are running --all and still have no token
+            print(
+                "ℹ️  Tip: Login with 'gh auth login' or set GITHUB_TOKEN to avoid rate limits.\n"
+            )
 
     if args.all:
         # Strategy: Iterate over the ROOT node's inputs (Direct Dependencies)

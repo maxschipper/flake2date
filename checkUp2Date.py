@@ -1,154 +1,187 @@
 import argparse
 import json
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 
 import requests
 
-# import time
-
 # --- Configuration ---
-# Get the path to the flake.lock file from the environment variable
-# Use a fallback path if the environment variable is not set
-FLAKE_LOCK_PATH: str = os.environ.get("NH_FLAKE", ".") + "/flake.lock"
-GITHUB_API_URL: str
-DOWNSTREAM_HUMAN_TIME: str
-UPSTREAM_HUMAN_TIME: str
-
-# Initialize the parser
-parser = argparse.ArgumentParser(
-    description="Check if a Nix flake input is up to date."
-)
-
-# Add the argument (the name of the input)
-parser.add_argument(
-    "flake_input", help="The name of the flake input to check (e.g., nixpkgs)"
-)
-
-# Parse the arguments
-args = parser.parse_args()
-
-# Assign the argument value to your variable
-CHECK_FLAKE = args.flake_input
+FLAKE_LOCK_PATH = os.environ.get("NH_FLAKE", ".") + "/flake.lock"
 
 
-CHECK_FLAKE: str = input("check flake: ")
+def get_token_from_gh_cli():
+    """Attempts to retrieve the GitHub token from the 'gh' CLI tool."""
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
 
 
-# --- 2. Get DOWNSTREAM TIME from flake.lock ---
-try:
-    print(f"\nChecking flake.lock file at: {FLAKE_LOCK_PATH}")
-    with open(FLAKE_LOCK_PATH, "r") as f:
-        lock_data = json.load(f)
+def get_upstream_info(owner, repo, branch_hint=None, token=None):
+    """Fetches commit timestamp from GitHub."""
+    headers = {}
+    if token:
+        headers["Authorization"] = f"token {token}"
 
-    if CHECK_FLAKE not in lock_data["nodes"]:
-        print(f"Error: Node '{CHECK_FLAKE}' not found in lock file.")
-        exit(1)
+    branch = branch_hint
+    if not branch:
+        try:
+            resp = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo}", headers=headers
+            )
+            resp.raise_for_status()
+            branch = resp.json().get("default_branch")
+        except requests.RequestException:
+            return None, None
 
-    node = lock_data["nodes"][CHECK_FLAKE]
+    try:
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/branches/{branch}"
+        resp = requests.get(api_url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
 
-    # The value is an integer Unix timestamp (e.g., 1698379200)
-    DOWNSTREAM_TIME = node["locked"]["lastModified"]
-    # Optionally convert the timestamp back to a human-readable format for verification
-    downstream_dt = datetime.fromtimestamp(DOWNSTREAM_TIME)
-    DOWNSTREAM_HUMAN_TIME = downstream_dt.isoformat()
-    print(f"Local Last Modified: {DOWNSTREAM_HUMAN_TIME}")
+        date_str = data["commit"]["commit"]["committer"]["date"]
+        dt_utc = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        return int(dt_utc.timestamp()), dt_utc.astimezone()
+    except requests.RequestException:
+        return None, None
 
-    owner = node["locked"]["owner"]
-    repo = node["locked"]["repo"]
 
-    # Check if 'original' has a 'ref' (this is the branch, e.g., 'nixos-unstable')
-    # Use .get() because 'original' might not exist or might not have 'ref'
-    branch = node.get("original", {}).get("ref")
+def check_input(name, node_data, token=None, only_outdated=False):
+    """
+    Checks a single flake input.
+    If only_outdated is True, it prints nothing unless an update is found.
+    """
+    try:
+        if node_data["locked"]["type"] != "github":
+            return
 
-    if branch:
-        print(f"Tracking explicit branch: '{branch}'")
+        downstream_ts = node_data["locked"]["lastModified"]
+        downstream_dt = datetime.fromtimestamp(downstream_ts).astimezone()
+        owner = node_data["locked"]["owner"]
+        repo = node_data["locked"]["repo"]
+        branch_hint = node_data.get("original", {}).get("ref")
+    except KeyError:
+        return
+
+    # Fetch Upstream
+    upstream_ts, upstream_dt = get_upstream_info(owner, repo, branch_hint, token)
+
+    if upstream_ts is None:
+        if not only_outdated:
+            print(f"Checking {name} ({owner}/{repo})...")
+            print(f"    ❌ Could not fetch upstream info.")
+        return
+
+    # Logic: Should we print?
+    is_outdated = downstream_ts < upstream_ts
+
+    # If we only want outdated ones, and this is NOT outdated, return silently.
+    if only_outdated and not is_outdated:
+        return
+
+    print(f"Checking {name} ({owner}/{repo})...")
+
+    if is_outdated:
+        diff = timedelta(seconds=upstream_ts - downstream_ts)
+        print(f"    🚨 UPDATE AVAILABLE")
+        print(f"       Local:    {downstream_dt}")
+        print(f"       Upstream: {upstream_dt}")
+        print(f"       Lag:      {diff}")
+    elif downstream_ts > upstream_ts:
+        diff = timedelta(seconds=downstream_ts - upstream_ts)
+        print(f"    ⚠️  Local ahead by {diff}")
     else:
-        # If no ref is specified, we must find the repo's default branch (main/master)
-        print("No explicit branch found. Querying GitHub for default branch...")
-        repo_info_url = f"https://api.github.com/repos/{owner}/{repo}"
+        print(f"    ✅ Up to date")
 
-        # We need a separate request just to find if it is 'main' or 'master'
-        meta_response = requests.get(repo_info_url)
-        meta_response.raise_for_status()
-        branch = meta_response.json().get("default_branch")
-        print(f"Detected default branch: '{branch}'")
-
-    # 4. Construct the Final API URL
-    GITHUB_API_URL = f"https://api.github.com/repos/{owner}/{repo}/branches/{branch}"
-
-    # GITHUB_API_URL = f"https://api.github.com/repos/{lock_data['nodes'][CHECK_FLAKE]['locked']['owner']}/{lock_data['nodes'][CHECK_FLAKE]['locked']['repo']}/branches/{lock_data['nodes'][CHECK_FLAKE]['original']['ref']}"
-    # GITHUB_API_URL = f"https://api.github.com/repos/{lock_data['nodes'][CHECK_FLAKE]['locked']['owner']}/{lock_data['nodes'][CHECK_FLAKE]['locked']['repo']}/branches/main"
+    print("-" * 40)
 
 
-except FileNotFoundError:
-    print(
-        f"Error: flake.lock not found at {FLAKE_LOCK_PATH}. Check if NH_FLAKE is set correctly."
-    )
-    exit(1)
-except json.JSONDecodeError as e:
-    print(f"Error: Invalid JSON in {FLAKE_LOCK_PATH}: {e}")
-    exit(1)
-except KeyError as e:
-    print(f"Error parsing flake.lock: Missing key {e}")
-    print(f"Ensure the '{CHECK_FLAKE}' node exists in the lock file.")
-    exit(1)
-except requests.exceptions.RequestException as e:
-    print(f"Error fetching repo metadata: {e}")
-    exit(1)
-
-
-# --- 1. Get UPSTREAM TIME from GitHub API ---
-
-try:
-    print(f"Checking GitHub API at: {GITHUB_API_URL}")
-    response = requests.get(GITHUB_API_URL)
-    response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
-    github_data = response.json()
-
-    # # The date is a string in ISO 8601 format (e.g., "2023-10-27T12:00:00Z")
-    # # Your bash script's `jq` uses the date from `.commit.commit.committer.date`
-    # date_str = github_data["commit"]["commit"]["committer"]["date"]
-
-    # # Convert the ISO 8601 string to a datetime object
-    # # The 'Z' at the end of the date string signifies UTC (Zulu time)
-    # upstream_dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
-    # # 2. Force it to be UTC aware
-    # upstream_dt = upstream_dt.replace(tzinfo=timezone.utc)
-
-    date_str = github_data["commit"]["commit"]["committer"]["date"]
-
-    # 1. Parse the GitHub string as UTC (because it ends in Z)
-    upstream_utc = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check Nix flake inputs against GitHub upstream."
     )
 
-    # 2. Get the Unix timestamp (integers always compare correctly regardless of timezone)
-    UPSTREAM_TIME = int(upstream_utc.timestamp())
+    # Mutually Exclusive Group
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "flake_input", nargs="?", help="The name of the flake input to check"
+    )
+    group.add_argument(
+        "-a", "--all", action="store_true", help="Check all inputs and show all results"
+    )
+    group.add_argument(
+        "-A",
+        "--all-outdated",
+        action="store_true",
+        help="Check all inputs but ONLY show outdated ones",
+    )
 
-    # 3. Convert to LOCAL time for the print statement so it matches the one above
-    upstream_local = upstream_utc.astimezone()
+    args = parser.parse_args()
 
-    UPSTREAM_HUMAN_TIME = upstream_local.isoformat()
-    print(f"Upstream Last Commit:   {UPSTREAM_HUMAN_TIME}")
+    # Determine execution mode
+    check_all = args.all or args.all_outdated
+    only_outdated = args.all_outdated
+
+    # Load Lock File
+    try:
+        with open(FLAKE_LOCK_PATH, "r") as f:
+            lock_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Error reading lock file: {e}")
+        sys.exit(1)
+
+    # Auth Token
+    token = os.environ.get("GITHUB_TOKEN") or get_token_from_gh_cli()
+    if not token and check_all:
+        # Print tip only if we are showing everything.
+        # In 'only_outdated' mode, we generally want less noise unless necessary.
+        if not only_outdated:
+            print(
+                "ℹ️  Tip: Set GITHUB_TOKEN or use 'gh auth login' to avoid rate limits.\n"
+            )
+
+    # Execution Loop
+    if check_all:
+        root_node_name = lock_data.get("root", "root")
+        root_inputs = (
+            lock_data.get("nodes", {}).get(root_node_name, {}).get("inputs", {})
+        )
+
+        # If we can't find specific root inputs, fall back to checking every node
+        target_nodes = (
+            root_inputs.items() if root_inputs else lock_data["nodes"].items()
+        )
+
+        if not target_nodes and not only_outdated:
+            print("No inputs found to check.")
+
+        for name, node_key in target_nodes:
+            # Handle case where keys map to node names
+            actual_node_name = node_key if isinstance(node_key, str) else name
+            if actual_node_name in lock_data["nodes"]:
+                check_input(
+                    name, lock_data["nodes"][actual_node_name], token, only_outdated
+                )
+    else:
+        # Check single specific input (Never hide output here)
+        if args.flake_input not in lock_data["nodes"]:
+            print(f"Error: Input '{args.flake_input}' not found.")
+            sys.exit(1)
+        check_input(
+            args.flake_input,
+            lock_data["nodes"][args.flake_input],
+            token,
+            only_outdated=False,
+        )
 
 
-except requests.exceptions.RequestException as e:
-    print(f"Error fetching data from GitHub: {e}")
-    exit(1)
-except KeyError as e:
-    print(f"Error parsing GitHub response: Missing key {e}")
-    exit(1)
-
-
-# --- 3. Compare Times and Output Result ---
-print("\n--- Comparison ---")
-if DOWNSTREAM_TIME < UPSTREAM_TIME:
-    print(f"🚨 {CHECK_FLAKE} has new commits")
-    print(f"Local time:    {DOWNSTREAM_HUMAN_TIME}")
-    print(f"Upstream time: {UPSTREAM_HUMAN_TIME}")
-    seconds_diff = UPSTREAM_TIME - DOWNSTREAM_TIME
-    time_diff = timedelta(seconds=seconds_diff)
-    print(f"Time since last update: {time_diff}")
-else:
-    print(f"✅ lock for {CHECK_FLAKE} is up to date")
+if __name__ == "__main__":
+    main()

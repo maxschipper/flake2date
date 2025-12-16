@@ -7,3 +7,6 @@ requires-python = ">=3.13"
 dependencies = ["requests>=2.32.5"]
 
 scripts = { flake-check = "checkUp2Date:main" }
+# run `uv tool install .` into ~/.local/bin 
+# on nixos set `environment.localBinInPath = true;`
+

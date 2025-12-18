@@ -77,7 +77,7 @@ def check_input(name, node_data, token=None, only_outdated=False):
     if upstream_ts is None:
         if not only_outdated:
             print(f"Checking {name} ({owner}/{repo})...")
-            print(f"    ❌ Could not fetch upstream info.")
+            print("    ❌ Could not fetch upstream info.")
         return
 
     # Logic: Should we print?
@@ -91,7 +91,7 @@ def check_input(name, node_data, token=None, only_outdated=False):
 
     if is_outdated:
         diff = timedelta(seconds=upstream_ts - downstream_ts)
-        print(f"    🚨 UPDATE AVAILABLE")
+        print("    🚨 UPDATE AVAILABLE")
         print(f"       Local:    {downstream_dt}")
         print(f"       Upstream: {upstream_dt}")
         print(f"       Lag:      {diff}")
@@ -99,7 +99,7 @@ def check_input(name, node_data, token=None, only_outdated=False):
         diff = timedelta(seconds=downstream_ts - upstream_ts)
         print(f"    ⚠️  Local ahead by {diff}")
     else:
-        print(f"    ✅ Up to date")
+        print("    ✅ Up to date")
 
     print("-" * 40)
 

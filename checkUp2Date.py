@@ -110,9 +110,12 @@ def main():
     )
 
     # Mutually Exclusive Group
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
-        "flake_input", nargs="?", help="The name of the flake input to check"
+        "flake_input",
+        nargs="?",
+        default="nixpkgs",
+        help="The name of the flake input to check (default: nixpkgs)",
     )
     group.add_argument(
         "-a", "--all", action="store_true", help="Check all inputs and show all results"
